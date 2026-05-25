@@ -1,4 +1,4 @@
-import { useState, useMemo, useEffect } from 'react';
+import { useState, useMemo, useEffect, useRef } from 'react';
 import { MainLayout } from '@/components/layout/MainLayout';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
@@ -79,6 +79,7 @@ export default function ItemsList() {
   const navigate = useNavigate();
   const { toast } = useToast();
   const { role } = useAuth();
+  const importFileInputRef = useRef<HTMLInputElement | null>(null);
   const [searchQuery, setSearchQuery] = useState(() => sessionStorage.getItem('lostItems_search') || '');
   const [statusFilter, setStatusFilter] = useState<ItemStatus | 'all'>(() => (sessionStorage.getItem('lostItems_status') as ItemStatus | 'all') || 'available');
   const [campusFilter, setCampusFilter] = useState<CampusEnum | 'all'>(() => (sessionStorage.getItem('lostItems_campus') as CampusEnum | 'all') || 'all');
@@ -545,29 +546,54 @@ export default function ItemsList() {
     }
   };
 
-  // Helper function to parse dates in various formats (DD/MM/YYYY or YYYY-MM-DD)
+  // Helper function to parse dates in various formats (DD/MM/YYYY, YYYY-MM-DD, Date or Excel serial)
   const parseDate = (dateValue: any): string => {
-    if (!dateValue) return new Date().toISOString().split('T')[0];
-    
-    // If it's already a valid ISO date string
-    if (typeof dateValue === 'string' && /^\d{4}-\d{2}-\d{2}/.test(dateValue)) {
-      return dateValue.split('T')[0];
+    const today = new Date().toISOString().split('T')[0];
+
+    if (dateValue === undefined || dateValue === null || String(dateValue).trim() === '') {
+      return today;
     }
-    
-    // If it's in DD/MM/YYYY format
-    if (typeof dateValue === 'string' && /^\d{1,2}\/\d{1,2}\/\d{4}$/.test(dateValue)) {
-      const [day, month, year] = dateValue.split('/');
-      return `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
+
+    if (dateValue instanceof Date && !Number.isNaN(dateValue.getTime())) {
+      return dateValue.toISOString().split('T')[0];
     }
-    
+
+    if (typeof dateValue === 'string') {
+      const trimmed = dateValue.trim();
+
+      // If it's already a valid ISO date string
+      if (/^\d{4}-\d{2}-\d{2}/.test(trimmed)) {
+        return trimmed.split('T')[0];
+      }
+
+      // If it's in DD/MM/YYYY format
+      if (/^\d{1,2}\/\d{1,2}\/\d{4}$/.test(trimmed)) {
+        const [day, month, year] = trimmed.split('/');
+        return `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
+      }
+
+      // If it's in DD/MM/YY format
+      if (/^\d{1,2}\/\d{1,2}\/\d{2}$/.test(trimmed)) {
+        const [day, month, year] = trimmed.split('/');
+        return `20${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
+      }
+
+      const parsed = new Date(trimmed);
+      if (!Number.isNaN(parsed.getTime())) {
+        return parsed.toISOString().split('T')[0];
+      }
+    }
+
     // If it's an Excel serial date number
     if (typeof dateValue === 'number') {
       const excelEpoch = new Date(1899, 11, 30);
       const date = new Date(excelEpoch.getTime() + dateValue * 24 * 60 * 60 * 1000);
-      return date.toISOString().split('T')[0];
+      if (!Number.isNaN(date.getTime())) {
+        return date.toISOString().split('T')[0];
+      }
     }
-    
-    return new Date().toISOString().split('T')[0];
+
+    return today;
   };
 
   const downloadTemplate = () => {
@@ -675,50 +701,223 @@ export default function ItemsList() {
     return 'Campus I';
   };
 
+  const normalizeKey = (key: string) => {
+    return key
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase()
+      .trim()
+      .replace(/\s+/g, '_')
+      .replace(/[^\w]/g, '_')
+      .replace(/_+/g, '_')
+      .replace(/^_|_$/g, '');
+  };
+
+  const normalizeRow = (row: Record<string, any>) => {
+    const normalized: Record<string, any> = {};
+
+    Object.entries(row).forEach(([key, value]) => {
+      normalized[normalizeKey(key)] = value;
+    });
+
+    return normalized;
+  };
+
+  const getValue = (row: Record<string, any>, keys: string[]) => {
+    for (const key of keys) {
+      const normalizedKey = normalizeKey(key);
+      const value = row[normalizedKey];
+
+      if (value !== undefined && value !== null && String(value).trim() !== '') {
+        return value;
+      }
+    }
+
+    return undefined;
+  };
+
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (!file) return;
+
+    if (!file) {
+      return;
+    }
+
+    console.log('[Importar itens] Arquivo selecionado:', {
+      name: file.name,
+      type: file.type,
+      size: file.size,
+    });
 
     const reader = new FileReader();
-    reader.onload = (evt) => {
-      const data = evt.target?.result;
-      const workbook = XLSX.read(data, { type: 'binary' });
-      const sheetName = workbook.SheetNames[0];
-      const worksheet = workbook.Sheets[sheetName];
-      const jsonData = XLSX.utils.sheet_to_json(worksheet);
-      
-      // Map columns to expected format - now including codigo_item
-      const mappedData = jsonData.map((row: any) => ({
-        code: row.codigo_item || row.codigo || row.Codigo || row.CODIGO || row.code || `AP-${Date.now()}-${Math.random().toString(36).substr(2, 4).toUpperCase()}`,
-        description: row.descricao || row.Descricao || row.DESCRICAO || row.description || '',
-        campus: mapCampus(row.campus || row.Campus || row.CAMPUS || 'Campus I'),
-        found_location: row.local || row.Local || row.LOCAL || row.found_location || 'Não informado',
-        found_date: parseDate(row.data_encontrado || row.found_date),
-        received_date: parseDate(row.data_recebido || row.received_date),
-        shelf: row.prateleira || row.shelf || null,
-        box: row.caixa || row.box || null,
-        seal_number: row.lacre || row.seal_number || null,
-        delivered_by_name: row.entregue_por || row.delivered_by_name || 'Importação',
-        delivered_by_contact: row.contato || row.delivered_by_contact || null,
-        status: mapStatus(row.situacao_item || row.status),
-      }));
 
-      setImportData(mappedData);
-      setImportPreview(mappedData.slice(0, 5));
-      setImportDialog(true);
+    reader.onload = (evt) => {
+      try {
+        const fileData = evt.target?.result;
+
+        if (!fileData) {
+          throw new Error('Não foi possível ler o arquivo selecionado.');
+        }
+
+        const workbook = XLSX.read(fileData, {
+          type: 'array',
+          cellDates: true,
+        });
+
+        const sheetName = workbook.SheetNames[0];
+
+        if (!sheetName) {
+          throw new Error('A planilha não possui nenhuma aba.');
+        }
+
+        const worksheet = workbook.Sheets[sheetName];
+
+        const jsonData = XLSX.utils.sheet_to_json<Record<string, any>>(worksheet, {
+          defval: '',
+        });
+
+        console.log('[Importar itens] Cabeçalhos encontrados:', jsonData[0] ? Object.keys(jsonData[0]) : []);
+        console.log('[Importar itens] Quantidade de linhas lidas:', jsonData.length);
+
+        if (!jsonData.length) {
+          toast({
+            title: 'Nenhum item encontrado',
+            description: 'A planilha está vazia ou não possui linhas válidas.',
+            variant: 'destructive',
+          });
+          return;
+        }
+
+        const today = new Date().toISOString().split('T')[0];
+
+        const mappedData = jsonData
+          .map((originalRow, index) => {
+            const row = normalizeRow(originalRow);
+
+            const code =
+              getValue(row, ['codigo_item', 'codigo', 'código', 'cod', 'code']) ||
+              `AP-${Date.now()}-${index + 1}`;
+
+            const description =
+              getValue(row, ['descricao', 'descrição', 'description', 'item', 'objeto']) || '';
+
+            const campus =
+              getValue(row, ['campus', 'unidade']) || 'Campus I';
+
+            const foundLocation =
+              getValue(row, ['local', 'local_encontrado', 'localização', 'localizacao', 'found_location']) ||
+              'Não informado';
+
+            const foundDate =
+              getValue(row, ['data_encontrado', 'data_encontrada', 'data', 'found_date']) || today;
+
+            const receivedDate =
+              getValue(row, ['data_recebido', 'data_recebida', 'received_date']) || today;
+
+            const deliveredByName =
+              getValue(row, ['entregue_por', 'entregue_por_nome', 'recebido_por', 'delivered_by_name']) ||
+              'Importação';
+
+            const status =
+              getValue(row, ['situacao_item', 'situação_item', 'situacao', 'situação', 'status']) ||
+              'available';
+
+            return {
+              code: String(code).trim(),
+              description: String(description).trim(),
+              campus: mapCampus(String(campus)),
+              found_location: String(foundLocation).trim(),
+              found_date: parseDate(foundDate),
+              received_date: parseDate(receivedDate),
+              shelf: getValue(row, ['prateleira', 'shelf']) || null,
+              box: getValue(row, ['caixa', 'box']) || null,
+              seal_number: getValue(row, ['lacre', 'seal_number']) || null,
+              delivered_by_name: String(deliveredByName).trim(),
+              delivered_by_contact: getValue(row, ['contato', 'telefone', 'delivered_by_contact']) || null,
+              status: mapStatus(String(status)),
+            };
+          })
+          .filter((item) => item.code && item.description);
+
+        console.log('[Importar itens] Dados convertidos para importação:', mappedData);
+
+        if (!mappedData.length) {
+          toast({
+            title: 'Nenhum item válido',
+            description: 'Verifique se a planilha possui pelo menos código e descrição.',
+            variant: 'destructive',
+          });
+          return;
+        }
+
+        setImportData(mappedData);
+        setImportPreview(mappedData.slice(0, 5));
+        setImportDialog(true);
+
+        toast({
+          title: 'Planilha carregada',
+          description: `${mappedData.length} item(ns) encontrado(s). Confira a prévia antes de importar.`,
+        });
+      } catch (error: any) {
+        console.error('[Importar itens] Erro ao processar planilha:', error);
+
+        toast({
+          title: 'Erro ao ler planilha',
+          description: error.message || 'Não foi possível processar o arquivo selecionado.',
+          variant: 'destructive',
+        });
+      } finally {
+        e.target.value = '';
+      }
     };
-    reader.readAsBinaryString(file);
-    e.target.value = '';
+
+    reader.onerror = () => {
+      console.error('[Importar itens] Erro no FileReader:', reader.error);
+
+      toast({
+        title: 'Erro ao abrir arquivo',
+        description: 'Não foi possível abrir o arquivo selecionado.',
+        variant: 'destructive',
+      });
+
+      e.target.value = '';
+    };
+
+    reader.readAsArrayBuffer(file);
   };
 
   const handleImport = async () => {
-    if (importData.length === 0) return;
+    if (importData.length === 0) {
+      toast({
+        title: 'Nenhum item para importar',
+        description: 'Selecione uma planilha válida antes de importar.',
+        variant: 'destructive',
+      });
+      return;
+    }
 
-    await bulkCreate.mutateAsync({ items: importData, replaceExisting });
-    setImportDialog(false);
-    setImportData([]);
-    setImportPreview([]);
-    setReplaceExisting(false);
+    try {
+      console.log('[Importar itens] Enviando itens para o Supabase:', importData);
+      await bulkCreate.mutateAsync({ items: importData, replaceExisting });
+
+      toast({
+        title: 'Importação concluída',
+        description: `${importData.length} item(ns) importado(s) com sucesso.`,
+      });
+
+      setImportDialog(false);
+      setImportData([]);
+      setImportPreview([]);
+      setReplaceExisting(false);
+    } catch (error: any) {
+      console.error('[Importar itens] Erro ao importar itens:', error);
+
+      toast({
+        title: 'Erro ao importar itens',
+        description: error.message || 'Não foi possível importar os itens da planilha.',
+        variant: 'destructive',
+      });
+    }
   };
 
   return (
@@ -870,17 +1069,16 @@ export default function ItemsList() {
                 Baixar Modelo Excel
               </DropdownMenuItem>
               <DropdownMenuSeparator />
-              <DropdownMenuItem asChild>
-                <label className="flex items-center cursor-pointer">
-                  <Upload className="w-4 h-4 mr-2" />
-                  Importar Itens
-                  <input
-                    type="file"
-                    accept=".xlsx,.xls,.csv"
-                    className="hidden"
-                    onChange={handleFileUpload}
-                  />
-                </label>
+              <DropdownMenuItem
+                onSelect={(event) => {
+                  event.preventDefault();
+                  setTimeout(() => {
+                    importFileInputRef.current?.click();
+                  }, 0);
+                }}
+              >
+                <Upload className="w-4 h-4 mr-2" />
+                Importar Itens
               </DropdownMenuItem>
               <DropdownMenuItem onClick={() => setBulkImageDialog(true)}>
                 <ImageIcon className="w-4 h-4 mr-2" />
@@ -888,6 +1086,14 @@ export default function ItemsList() {
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
+
+          <input
+            ref={importFileInputRef}
+            type="file"
+            accept=".xlsx,.xls,.csv"
+            className="hidden"
+            onChange={handleFileUpload}
+          />
 
           {/* Admin Actions Dropdown */}
           {role === 'admin' && (
@@ -1131,7 +1337,7 @@ export default function ItemsList() {
             <Button variant="outline" onClick={() => setImportDialog(false)}>
               Cancelar
             </Button>
-            <Button onClick={handleImport} disabled={bulkCreate.isPending}>
+            <Button onClick={handleImport} disabled={bulkCreate.isPending || importData.length === 0}>
               {bulkCreate.isPending && <Loader2 className="w-4 h-4 mr-2 animate-spin" />}
               Importar {importData.length} Item(ns)
             </Button>
