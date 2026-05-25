@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import { useQueryClient } from '@tanstack/react-query';
+import { useQueryClient, type QueryClient } from '@tanstack/react-query';
 import { supabase } from '@/integrations/supabase/client';
 import { RealtimeChannel } from '@supabase/supabase-js';
 
@@ -54,7 +54,7 @@ const tableToQueryKeyMap: Record<TableName, string[]> = {
     'lost-item',
     'lost-items-counts',
   ],
-  lost_items_archive: ['archived-items'],
+  lost_items_archive: ['archived-items', 'lost-items-archive'],
 
   material_requests: ['material-requests'],
 
@@ -88,24 +88,98 @@ const tableToQueryKeyMap: Record<TableName, string[]> = {
   app_settings: ['app-settings'],
 };
 
-function invalidateRelatedQueries(
-  queryClient: ReturnType<typeof useQueryClient>,
-  table: TableName
-) {
-  const relatedKeys = tableToQueryKeyMap[table] || [table];
+const getFirstQueryKey = (queryKey: readonly unknown[]) => String(queryKey[0] ?? '');
 
-  relatedKeys.forEach((key) => {
+function invalidateAndRefetchQueries(queryClient: QueryClient, queryKeys: string[]) {
+  queryKeys.forEach((key) => {
     queryClient.invalidateQueries({
-      predicate: (query) => {
-        const firstKey = query.queryKey[0];
-        return firstKey === key;
-      },
+      predicate: (query) => getFirstQueryKey(query.queryKey) === key,
+    });
+
+    queryClient.refetchQueries({
+      predicate: (query) => getFirstQueryKey(query.queryKey) === key && query.isActive(),
+      type: 'active',
     });
   });
 }
 
+function removeDeletedLostItemFromCache(queryClient: QueryClient, deletedId?: string) {
+  if (!deletedId) return;
+
+  queryClient.setQueriesData(
+    {
+      predicate: (query) => getFirstQueryKey(query.queryKey) === 'lost-items-infinite',
+    },
+    (oldData: any) => {
+      if (!oldData?.pages) return oldData;
+
+      return {
+        ...oldData,
+        pages: oldData.pages.map((page: any) => {
+          if (!Array.isArray(page?.items)) return page;
+
+          const itemWasInPage = page.items.some((item: any) => item.id === deletedId);
+
+          return {
+            ...page,
+            items: page.items.filter((item: any) => item.id !== deletedId),
+            totalCount: itemWasInPage
+              ? Math.max((page.totalCount ?? page.items.length) - 1, 0)
+              : page.totalCount,
+          };
+        }),
+      };
+    }
+  );
+
+  queryClient.setQueriesData(
+    {
+      predicate: (query) => getFirstQueryKey(query.queryKey) === 'lost-items',
+    },
+    (oldData: any) => {
+      if (Array.isArray(oldData)) {
+        return oldData.filter((item: any) => item.id !== deletedId);
+      }
+
+      if (!oldData?.items) return oldData;
+
+      const itemWasInList = oldData.items.some((item: any) => item.id === deletedId);
+
+      return {
+        ...oldData,
+        items: oldData.items.filter((item: any) => item.id !== deletedId),
+        totalCount: itemWasInList
+          ? Math.max((oldData.totalCount ?? oldData.items.length) - 1, 0)
+          : oldData.totalCount,
+      };
+    }
+  );
+
+  queryClient.removeQueries({
+    predicate: (query) =>
+      getFirstQueryKey(query.queryKey) === 'lost-item' &&
+      query.queryKey.some((value) => value === deletedId),
+  });
+}
+
+function invalidateRelatedQueries(
+  queryClient: QueryClient,
+  table: TableName,
+  payload?: any
+) {
+  const relatedKeys = tableToQueryKeyMap[table] || [table];
+
+  if (table === 'lost_items' && payload?.eventType === 'DELETE') {
+    const deletedId = payload.old?.id;
+    removeDeletedLostItemFromCache(queryClient, deletedId);
+  }
+
+  invalidateAndRefetchQueries(queryClient, relatedKeys);
+}
+
 export function useRealtimeSubscription(tables: TableName[] = []) {
   const queryClient = useQueryClient();
+  const tablesKey = tables.join(',');
 
   useEffect(() => {
     if (tables.length === 0) return;
@@ -125,10 +199,10 @@ export function useRealtimeSubscription(tables: TableName[] = []) {
           (payload) => {
             console.log(`Realtime update on ${table}:`, payload.eventType, payload);
 
-            invalidateRelatedQueries(queryClient, table);
+            invalidateRelatedQueries(queryClient, table, payload);
 
             if (table === 'lost_items') {
-              console.log('Invalidando cache de Achados e Perdidos...');
+              console.log('Cache de Achados e Perdidos atualizado/refetch solicitado.');
             }
           }
         )
@@ -158,7 +232,7 @@ export function useRealtimeSubscription(tables: TableName[] = []) {
         supabase.removeChannel(channel);
       });
     };
-  }, [tables.join(','), queryClient]);
+  }, [tablesKey, queryClient]);
 }
 
 export function useGlobalRealtimeSubscription() {
